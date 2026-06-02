@@ -1,0 +1,7 @@
+# aux_msg 符号导出控制：仅暴露 aux_* 前缀符号
+{
+    global:
+        aux_*;
+    local:
+        *;
+};
