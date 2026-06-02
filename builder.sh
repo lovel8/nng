@@ -276,6 +276,7 @@ configure() {
           -G "${generator}" \
           -DCMAKE_BUILD_TYPE="${cbt}" \
           -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
           -DBUILD_SHARED_LIBS=OFF \
           -DNNG_ENABLE_TLS="${NNG_ENABLE_TLS}" \
           -DNNG_TLS_ENGINE="${NNG_TLS_ENGINE}" \
