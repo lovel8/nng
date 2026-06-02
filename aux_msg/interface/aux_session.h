@@ -41,7 +41,7 @@ void aux_session_send_async(aux_session sess, aux_future *fut);
 void aux_session_recv_async(aux_session sess, aux_future *fut);
 
 // 同步发送消息信封
-aux_err aux_session_send_envelope(aux_session sess, aux_envelope *env, int flags);
+aux_err aux_session_send_envelope(aux_session sess, aux_envelope *env, int flags, aux_priority priority);
 
 // 同步接收消息信封
 aux_err aux_session_recv_envelope(aux_session sess, aux_envelope *env, int flags);

@@ -113,6 +113,8 @@ target_include_directories(aux_msg
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter/nng>
         $<INSTALL_INTERFACE:include/aux_msg>
         ${NNG_INCLUDE_DIRS}
+    PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/../src/core>
 )
 
 # 将 NNG 静态链接进 aux_msg，使用者只需 -laux_msg 即可

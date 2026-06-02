@@ -53,7 +53,7 @@ void aux_channel_recv_async(aux_channel ch, aux_future *fut);
  * ================================================================ */
 
 // 同步发送消息信封
-aux_err aux_channel_send_envelope(aux_channel ch, aux_envelope *env, int flags);
+aux_err aux_channel_send_envelope(aux_channel ch, aux_envelope *env, int flags, aux_priority priority);
 
 // 同步接收消息信封
 aux_err aux_channel_recv_envelope(aux_channel ch, aux_envelope *env, int flags);

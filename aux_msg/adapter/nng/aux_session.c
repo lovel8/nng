@@ -5,6 +5,7 @@
  */
 
 #include "aux_session.h"
+#include "message.h" // nni_msg_set_priority
 
 aux_err aux_session_open(aux_session *sess, aux_channel ch)
     { return (aux_err)nng_ctx_open(&sess->inner, ch.inner); }
@@ -21,8 +22,11 @@ void aux_session_send_async(aux_session sess, aux_future *fut)
 void aux_session_recv_async(aux_session sess, aux_future *fut)
     { nng_ctx_recv(sess.inner, fut->inner); }
 
-aux_err aux_session_send_envelope(aux_session sess, aux_envelope *env, int flags)
-    { return (aux_err)nng_ctx_sendmsg(sess.inner, env->inner, flags); }
+aux_err aux_session_send_envelope(aux_session sess, aux_envelope *env, int flags, aux_priority priority)
+{
+    nni_msg_set_priority(env->inner, (int) priority);
+    return (aux_err)nng_ctx_sendmsg(sess.inner, env->inner, flags);
+}
 
 aux_err aux_session_recv_envelope(aux_session sess, aux_envelope *env, int flags)
     { return (aux_err)nng_ctx_recvmsg(sess.inner, &env->inner, flags); }

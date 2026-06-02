@@ -15,30 +15,80 @@
 #include "message.h"
 #include "pollable.h"
 
-// Message queue.  These operate in some respects like Go channels,
-// but as we have access to the internals, we have made some fundamental
-// differences and improvements.  For example, these can grow, and either
-// side can close, and they may be closed more than once.
+// Message queue with 2-level priority support.
+//
+// Two independent ring buffers: hi (priority=1) and lo (priority=0).
+// Dequeue always drains hi first. When total capacity is exhausted,
+// a high-priority message can evict the oldest lo message.
+//
+// Total messages = hi_len + lo_len, capped at mq_cap.
 
 struct nni_msgq {
 	nni_mtx   mq_lock;
 	unsigned  mq_cap;
-	unsigned  mq_alloc; // alloc is cap + 2...
-	unsigned  mq_len;
-	unsigned  mq_get;
-	unsigned  mq_put;
+	unsigned  mq_alloc; // alloc = cap + 2
 	bool      mq_closed;
-	nni_msg **mq_msgs;
+
+	// High-priority ring
+	unsigned  mq_hi_len;
+	unsigned  mq_hi_get;
+	unsigned  mq_hi_put;
+	nni_msg **mq_hi_msgs;
+
+	// Normal-priority ring
+	unsigned  mq_lo_len;
+	unsigned  mq_lo_get;
+	unsigned  mq_lo_put;
+	nni_msg **mq_lo_msgs;
 
 	nni_list mq_aio_putq;
 	nni_list mq_aio_getq;
 
-	// Pollable status.
 	nni_pollable mq_sendable;
 	nni_pollable mq_recvable;
 };
 
 static void nni_msgq_run_notify(nni_msgq *);
+
+// ---- helpers for the priority ring buffers ----
+
+static inline nni_msg *
+mq_ring_pop(nni_msg **ring, unsigned *len, unsigned *get, unsigned alloc)
+{
+	nni_msg *msg = ring[*get];
+	ring[*get] = NULL;
+	*get = (*get + 1) % alloc;
+	(*len)--;
+	return (msg);
+}
+
+static inline void
+mq_ring_push(
+    nni_msg **ring, unsigned *len, unsigned *put, unsigned alloc, nni_msg *msg)
+{
+	ring[*put] = msg;
+	*put = (*put + 1) % alloc;
+	(*len)++;
+}
+
+static inline unsigned
+mq_total(nni_msgq *mq)
+{
+	return (mq->mq_hi_len + mq->mq_lo_len);
+}
+
+// Evict the oldest normal-priority message. Returns true on success.
+static bool
+mq_try_evict_lo(nni_msgq *mq)
+{
+	if (mq->mq_lo_len == 0) {
+		return (false);
+	}
+	nni_msg *old = mq_ring_pop(
+	    mq->mq_lo_msgs, &mq->mq_lo_len, &mq->mq_lo_get, mq->mq_alloc);
+	nni_msg_free(old);
+	return (true);
+}
 
 int
 nni_msgq_init(nni_msgq **mqp, unsigned cap)
@@ -46,20 +96,24 @@ nni_msgq_init(nni_msgq **mqp, unsigned cap)
 	struct nni_msgq *mq;
 	unsigned         alloc;
 
-	// We allocate 2 extra cells in the fifo.  One to accommodate a
-	// waiting writer when cap == 0. (We can "briefly" move the message
-	// through.)  This lets us behave the same as unbuffered Go channels.
-	// The second cell is to permit pushback later, e.g. for REQ to stash
-	// a message back at the end to do a retry.
+	// alloc = cap + 2:
+	//   +1: support cap == 0 (unbuffered, like Go channel)
+	//   +1: pushback (e.g. REQ retry)
 	alloc = cap + 2;
 
 	if ((mq = NNI_ALLOC_STRUCT(mq)) == NULL) {
 		return (NNG_ENOMEM);
 	}
-	if ((mq->mq_msgs = nni_zalloc(sizeof(nng_msg *) * alloc)) == NULL) {
+	if ((mq->mq_hi_msgs = nni_zalloc(sizeof(nng_msg *) * alloc)) == NULL) {
 		NNI_FREE_STRUCT(mq);
 		return (NNG_ENOMEM);
 	}
+	if ((mq->mq_lo_msgs = nni_zalloc(sizeof(nng_msg *) * alloc)) == NULL) {
+		nni_free(mq->mq_hi_msgs, sizeof(nng_msg *) * alloc);
+		NNI_FREE_STRUCT(mq);
+		return (NNG_ENOMEM);
+	}
+
 	nni_aio_list_init(&mq->mq_aio_putq);
 	nni_aio_list_init(&mq->mq_aio_getq);
 	nni_mtx_init(&mq->mq_lock);
@@ -68,13 +122,24 @@ nni_msgq_init(nni_msgq **mqp, unsigned cap)
 
 	mq->mq_cap    = cap;
 	mq->mq_alloc  = alloc;
-	mq->mq_len    = 0;
-	mq->mq_get    = 0;
-	mq->mq_put    = 0;
-	mq->mq_closed = 0;
+	mq->mq_closed = false;
+	mq->mq_hi_len = 0;
+	mq->mq_hi_get = 0;
+	mq->mq_hi_put = 0;
+	mq->mq_lo_len = 0;
+	mq->mq_lo_get = 0;
+	mq->mq_lo_put = 0;
 	*mqp          = mq;
 
 	return (0);
+}
+
+static void
+mq_free_ring(nni_msg **ring, unsigned *len, unsigned *get, unsigned alloc)
+{
+	while (*len > 0) {
+		nni_msg_free(mq_ring_pop(ring, len, get, alloc));
+	}
 }
 
 void
@@ -85,21 +150,65 @@ nni_msgq_fini(nni_msgq *mq)
 	}
 	nni_mtx_fini(&mq->mq_lock);
 
-	/* Free any orphaned messages. */
-	while (mq->mq_len > 0) {
-		nni_msg *msg = mq->mq_msgs[mq->mq_get++];
-		if (mq->mq_get >= mq->mq_alloc) {
-			mq->mq_get = 0;
-		}
-		mq->mq_len--;
-		nni_msg_free(msg);
-	}
+	mq_free_ring(mq->mq_hi_msgs, &mq->mq_hi_len, &mq->mq_hi_get,
+	    mq->mq_alloc);
+	mq_free_ring(mq->mq_lo_msgs, &mq->mq_lo_len, &mq->mq_lo_get,
+	    mq->mq_alloc);
 
 	nni_pollable_fini(&mq->mq_sendable);
 	nni_pollable_fini(&mq->mq_recvable);
 
-	nni_free(mq->mq_msgs, mq->mq_alloc * sizeof(nng_msg *));
+	nni_free(mq->mq_hi_msgs, sizeof(nng_msg *) * mq->mq_alloc);
+	nni_free(mq->mq_lo_msgs, sizeof(nng_msg *) * mq->mq_alloc);
 	NNI_FREE_STRUCT(mq);
+}
+
+// Push a message into the appropriate priority ring.
+// Returns true on success (message consumed).
+static bool
+mq_put_prio(nni_msgq *mq, nni_msg *msg)
+{
+	unsigned  total = mq_total(mq);
+	unsigned *len, *put;
+	nni_msg **ring;
+
+	if (nni_msg_get_priority(msg) > 0) {
+		ring = mq->mq_hi_msgs;
+		len  = &mq->mq_hi_len;
+		put  = &mq->mq_hi_put;
+	} else {
+		ring = mq->mq_lo_msgs;
+		len  = &mq->mq_lo_len;
+		put  = &mq->mq_lo_put;
+	}
+
+	if (total < mq->mq_cap) {
+		mq_ring_push(ring, len, put, mq->mq_alloc, msg);
+		return (true);
+	}
+
+	// Queue full. Only high-priority can evict a lo message.
+	if (nni_msg_get_priority(msg) > 0 && mq_try_evict_lo(mq)) {
+		mq_ring_push(ring, len, put, mq->mq_alloc, msg);
+		return (true);
+	}
+
+	return (false);
+}
+
+// Pop the next message: high-priority first, then normal.
+static nni_msg *
+mq_get_prio(nni_msgq *mq)
+{
+	if (mq->mq_hi_len > 0) {
+		return (mq_ring_pop(
+		    mq->mq_hi_msgs, &mq->mq_hi_len, &mq->mq_hi_get, mq->mq_alloc));
+	}
+	if (mq->mq_lo_len > 0) {
+		return (mq_ring_pop(
+		    mq->mq_lo_msgs, &mq->mq_lo_len, &mq->mq_lo_get, mq->mq_alloc));
+	}
+	return (NULL);
 }
 
 static void
@@ -112,11 +221,8 @@ nni_msgq_run_putq(nni_msgq *mq)
 		size_t   len = nni_msg_len(msg);
 		nni_aio *raio;
 
-		// The presence of any blocked reader indicates that
-		// the queue is empty, otherwise it would have just taken
-		// data from the queue.
+		// If a reader is waiting, deliver directly (unbuffered path).
 		if ((raio = nni_list_first(&mq->mq_aio_getq)) != NULL) {
-
 			nni_aio_set_msg(waio, NULL);
 			nni_aio_list_remove(waio);
 			nni_aio_list_remove(raio);
@@ -125,20 +231,15 @@ nni_msgq_run_putq(nni_msgq *mq)
 			continue;
 		}
 
-		// Otherwise if we have room in the buffer, just queue it.
-		if (mq->mq_len < mq->mq_cap) {
+		// Try to buffer it.
+		if (mq_put_prio(mq, msg)) {
 			nni_list_remove(&mq->mq_aio_putq, waio);
-			mq->mq_msgs[mq->mq_put++] = msg;
-			if (mq->mq_put == mq->mq_alloc) {
-				mq->mq_put = 0;
-			}
-			mq->mq_len++;
 			nni_aio_set_msg(waio, NULL);
 			nni_aio_finish(waio, 0, len);
 			continue;
 		}
 
-		// Unable to make progress, leave the aio where it is.
+		// No progress possible; wait.
 		break;
 	}
 }
@@ -150,25 +251,17 @@ nni_msgq_run_getq(nni_msgq *mq)
 
 	while ((raio = nni_list_first(&mq->mq_aio_getq)) != NULL) {
 		nni_aio *waio;
-		// If anything is waiting in the queue, get it first.
-		if (mq->mq_len != 0) {
-			nni_msg *msg = mq->mq_msgs[mq->mq_get++];
-			if (mq->mq_get == mq->mq_alloc) {
-				mq->mq_get = 0;
-			}
-			mq->mq_len--;
 
+		if (mq_total(mq) != 0) {
 			nni_aio_list_remove(raio);
-			nni_aio_finish_msg(raio, msg);
+			nni_aio_finish_msg(raio, mq_get_prio(mq));
 			continue;
 		}
 
-		// Nothing queued (unbuffered?), maybe a writer is waiting.
+		// Unbuffered path: match with a waiting writer.
 		if ((waio = nni_list_first(&mq->mq_aio_putq)) != NULL) {
-			nni_msg *msg;
-			size_t   len;
-			msg = nni_aio_get_msg(waio);
-			len = nni_msg_len(msg);
+			nni_msg *msg = nni_aio_get_msg(waio);
+			size_t   len = nni_msg_len(msg);
 
 			nni_aio_set_msg(waio, NULL);
 			nni_aio_list_remove(waio);
@@ -176,12 +269,9 @@ nni_msgq_run_getq(nni_msgq *mq)
 
 			nni_aio_list_remove(raio);
 			nni_aio_finish_msg(raio, msg);
-
 			continue;
 		}
 
-		// No data to get, and no unbuffered writers waiting.  Just
-		// wait until something arrives.
 		break;
 	}
 }
@@ -189,12 +279,14 @@ nni_msgq_run_getq(nni_msgq *mq)
 static void
 nni_msgq_run_notify(nni_msgq *mq)
 {
-	if (mq->mq_len < mq->mq_cap || !nni_list_empty(&mq->mq_aio_getq)) {
+	unsigned total = mq_total(mq);
+
+	if (total < mq->mq_cap || !nni_list_empty(&mq->mq_aio_getq)) {
 		nni_pollable_raise(&mq->mq_sendable);
 	} else {
 		nni_pollable_clear(&mq->mq_sendable);
 	}
-	if ((mq->mq_len != 0) || !nni_list_empty(&mq->mq_aio_putq)) {
+	if (total != 0 || !nni_list_empty(&mq->mq_aio_putq)) {
 		nni_pollable_raise(&mq->mq_recvable);
 	} else {
 		nni_pollable_clear(&mq->mq_recvable);
@@ -219,9 +311,6 @@ void
 nni_msgq_aio_put(nni_msgq *mq, nni_aio *aio)
 {
 	nni_mtx_lock(&mq->mq_lock);
-
-	// If this is an instantaneous poll operation, and the queue has
-	// no room, nobody is waiting to receive, then report NNG_ETIMEDOUT.
 	if (!nni_aio_start(aio, nni_msgq_cancel, mq)) {
 		nni_mtx_unlock(&mq->mq_lock);
 		return;
@@ -229,7 +318,6 @@ nni_msgq_aio_put(nni_msgq *mq, nni_aio *aio)
 	nni_aio_list_append(&mq->mq_aio_putq, aio);
 	nni_msgq_run_putq(mq);
 	nni_msgq_run_notify(mq);
-
 	nni_mtx_unlock(&mq->mq_lock);
 }
 
@@ -241,11 +329,9 @@ nni_msgq_aio_get(nni_msgq *mq, nni_aio *aio)
 		nni_mtx_unlock(&mq->mq_lock);
 		return;
 	}
-
 	nni_aio_list_append(&mq->mq_aio_getq, aio);
 	nni_msgq_run_getq(mq);
 	nni_msgq_run_notify(mq);
-
 	nni_mtx_unlock(&mq->mq_lock);
 }
 
@@ -260,11 +346,8 @@ nni_msgq_tryput(nni_msgq *mq, nni_msg *msg)
 		return (NNG_ECLOSED);
 	}
 
-	// The presence of any blocked reader indicates that
-	// the queue is empty, otherwise it would have just taken
-	// data from the queue.
+	// Deliver directly to a waiting reader.
 	if ((raio = nni_list_first(&mq->mq_aio_getq)) != NULL) {
-
 		nni_list_remove(&mq->mq_aio_getq, raio);
 		nni_aio_finish_msg(raio, msg);
 		nni_msgq_run_notify(mq);
@@ -272,13 +355,7 @@ nni_msgq_tryput(nni_msgq *mq, nni_msg *msg)
 		return (0);
 	}
 
-	// Otherwise if we have room in the buffer, just queue it.
-	if (mq->mq_len < mq->mq_cap) {
-		mq->mq_msgs[mq->mq_put++] = msg;
-		if (mq->mq_put == mq->mq_alloc) {
-			mq->mq_put = 0;
-		}
-		mq->mq_len++;
+	if (mq_put_prio(mq, msg)) {
 		nni_msgq_run_notify(mq);
 		nni_mtx_unlock(&mq->mq_lock);
 		return (0);
@@ -295,23 +372,17 @@ nni_msgq_close(nni_msgq *mq)
 
 	nni_mtx_lock(&mq->mq_lock);
 	mq->mq_closed = true;
-	// Free the messages orphaned in the queue.
-	while (mq->mq_len > 0) {
-		nni_msg *msg = mq->mq_msgs[mq->mq_get++];
-		if (mq->mq_get >= mq->mq_alloc) {
-			mq->mq_get = 0;
-		}
-		mq->mq_len--;
-		nni_msg_free(msg);
-	}
 
-	// Let all pending blockers know we are closing the queue.
+	mq_free_ring(mq->mq_hi_msgs, &mq->mq_hi_len, &mq->mq_hi_get,
+	    mq->mq_alloc);
+	mq_free_ring(mq->mq_lo_msgs, &mq->mq_lo_len, &mq->mq_lo_get,
+	    mq->mq_alloc);
+
 	while (((aio = nni_list_first(&mq->mq_aio_getq)) != NULL) ||
 	    ((aio = nni_list_first(&mq->mq_aio_putq)) != NULL)) {
 		nni_aio_list_remove(aio);
 		nni_aio_finish_error(aio, NNG_ECLOSED);
 	}
-
 	nni_mtx_unlock(&mq->mq_lock);
 }
 
@@ -319,77 +390,90 @@ int
 nni_msgq_cap(nni_msgq *mq)
 {
 	int rv;
-
 	nni_mtx_lock(&mq->mq_lock);
 	rv = (int) mq->mq_cap;
 	nni_mtx_unlock(&mq->mq_lock);
 	return (rv);
 }
 
+// Copy messages from a ring to a newly allocated ring (used by resize).
+static void
+mq_copy_ring(nni_msg **src, unsigned *src_len, unsigned *src_get,
+    unsigned src_alloc, nni_msg **dst, unsigned *dst_len, unsigned *dst_put,
+    unsigned dst_alloc)
+{
+	while (*src_len > 0) {
+		nni_msg *msg = mq_ring_pop(src, src_len, src_get, src_alloc);
+		mq_ring_push(dst, dst_len, dst_put, dst_alloc, msg);
+	}
+}
+
 int
 nni_msgq_resize(nni_msgq *mq, int cap)
 {
-	unsigned  alloc;
-	nni_msg  *msg;
-	nni_msg **newq, **oldq;
-	unsigned  oldget;
-	unsigned  oldlen;
-	unsigned  oldalloc;
+	unsigned  new_alloc;
+	unsigned  old_alloc;
 
-	alloc = cap + 2;
-
-	if (alloc > mq->mq_alloc) {
-		newq = nni_zalloc(sizeof(nni_msg *) * alloc);
-		if (newq == NULL) {
-			return (NNG_ENOMEM);
-		}
-	} else {
-		newq = NULL;
-	}
+	new_alloc = (unsigned) cap + 2;
 
 	nni_mtx_lock(&mq->mq_lock);
-	while (mq->mq_len > ((unsigned) cap + 1)) {
-		// too many messages -- we allow that one for
-		// the case of pushback or cap == 0.
-		// we delete the oldest messages first
-		msg = mq->mq_msgs[mq->mq_get++];
-		if (mq->mq_get > mq->mq_alloc) {
-			mq->mq_get = 0;
+
+	// Drop excess messages: normal-priority first, then high-priority.
+	while (mq_total(mq) > ((unsigned) cap + 1)) {
+		if (mq->mq_lo_len > 0) {
+			nni_msg_free(mq_ring_pop(mq->mq_lo_msgs, &mq->mq_lo_len,
+			    &mq->mq_lo_get, mq->mq_alloc));
+		} else if (mq->mq_hi_len > 0) {
+			nni_msg_free(mq_ring_pop(mq->mq_hi_msgs, &mq->mq_hi_len,
+			    &mq->mq_hi_get, mq->mq_alloc));
+		} else {
+			break;
 		}
-		mq->mq_len--;
-		nni_msg_free(msg);
-	}
-	if (newq == NULL) {
-		// Just shrinking the queue, no changes
-		mq->mq_cap = cap;
-		goto out;
 	}
 
-	oldq     = mq->mq_msgs;
-	oldget   = mq->mq_get;
-	oldalloc = mq->mq_alloc;
-	oldlen   = mq->mq_len;
+	if (new_alloc > mq->mq_alloc) {
+		// Growing: allocate new larger rings and migrate.
+		nni_msg **new_hi, **new_lo;
+		unsigned  new_hi_len, new_hi_put;
+		unsigned  new_lo_len, new_lo_put;
 
-	mq->mq_msgs = newq;
-	mq->mq_len = mq->mq_get = mq->mq_put = 0;
-	mq->mq_cap                           = cap;
-	mq->mq_alloc                         = alloc;
+		new_hi = nni_zalloc(sizeof(nni_msg *) * new_alloc);
+		new_lo = nni_zalloc(sizeof(nni_msg *) * new_alloc);
+		if (new_hi == NULL || new_lo == NULL) {
+			nni_free(new_hi, sizeof(nni_msg *) * new_alloc);
+			nni_free(new_lo, sizeof(nni_msg *) * new_alloc);
+			nni_mtx_unlock(&mq->mq_lock);
+			return (NNG_ENOMEM);
+		}
 
-	while (oldlen) {
-		mq->mq_msgs[mq->mq_put++] = oldq[oldget++];
-		if (oldget == oldalloc) {
-			oldget = 0;
-		}
-		if (mq->mq_put == mq->mq_alloc) {
-			mq->mq_put = 0;
-		}
-		mq->mq_len++;
-		oldlen--;
+		old_alloc  = mq->mq_alloc;
+		new_hi_len = 0;
+		new_hi_put = 0;
+		new_lo_len = 0;
+		new_lo_put = 0;
+
+		mq_copy_ring(mq->mq_hi_msgs, &mq->mq_hi_len, &mq->mq_hi_get,
+		    old_alloc, new_hi, &new_hi_len, &new_hi_put, new_alloc);
+		mq_copy_ring(mq->mq_lo_msgs, &mq->mq_lo_len, &mq->mq_lo_get,
+		    old_alloc, new_lo, &new_lo_len, &new_lo_put, new_alloc);
+
+		nni_free(mq->mq_hi_msgs, sizeof(nni_msg *) * old_alloc);
+		nni_free(mq->mq_lo_msgs, sizeof(nni_msg *) * old_alloc);
+
+		mq->mq_hi_msgs = new_hi;
+		mq->mq_lo_msgs = new_lo;
+		mq->mq_hi_len  = new_hi_len;
+		mq->mq_hi_get  = 0;
+		mq->mq_hi_put  = new_hi_put;
+		mq->mq_lo_len  = new_lo_len;
+		mq->mq_lo_get  = 0;
+		mq->mq_lo_put  = new_lo_put;
 	}
-	nni_free(oldq, sizeof(nni_msg *) * oldalloc);
 
-out:
-	// Wake everyone up -- we changed everything.
+	// Always update cap and alloc (shrinking case).
+	mq->mq_cap   = (unsigned) cap;
+	mq->mq_alloc = new_alloc;
+
 	nni_mtx_unlock(&mq->mq_lock);
 	return (0);
 }
@@ -400,7 +484,6 @@ nni_msgq_get_recvable(nni_msgq *mq, nni_pollable **sp)
 	nni_mtx_lock(&mq->mq_lock);
 	nni_msgq_run_notify(mq);
 	nni_mtx_unlock(&mq->mq_lock);
-
 	*sp = &mq->mq_recvable;
 	return (0);
 }
@@ -411,7 +494,6 @@ nni_msgq_get_sendable(nni_msgq *mq, nni_pollable **sp)
 	nni_mtx_lock(&mq->mq_lock);
 	nni_msgq_run_notify(mq);
 	nni_mtx_unlock(&mq->mq_lock);
-
 	*sp = &mq->mq_sendable;
 	return (0);
 }

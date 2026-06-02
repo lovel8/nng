@@ -30,6 +30,7 @@ struct nng_msg {
 	size_t         m_header_len;
 	nni_chunk      m_body;
 	uint32_t       m_pipe; // set on receive
+	int            m_priority; // 0=normal, 1=high
 	nni_atomic_int m_refcnt;
 	nng_sockaddr   m_addr; // set on receive, transport use
 };
@@ -425,6 +426,7 @@ nni_msg_alloc(nni_msg **mp, size_t sz)
 	// We always start with a single valid reference count.
 	nni_atomic_init(&m->m_refcnt);
 	nni_atomic_set(&m->m_refcnt, 1);
+	m->m_priority = 0; // default normal priority
 	*mp = m;
 	return (0);
 }
@@ -447,7 +449,8 @@ nni_msg_dup(nni_msg **dup, const nni_msg *src)
 		return (rv);
 	}
 
-	m->m_pipe = src->m_pipe;
+	m->m_pipe     = src->m_pipe;
+	m->m_priority = src->m_priority;
 	nni_atomic_init(&m->m_refcnt);
 	nni_atomic_set(&m->m_refcnt, 1);
 
@@ -670,4 +673,16 @@ void
 nni_msg_set_address(nng_msg *msg, const nng_sockaddr *addr)
 {
 	msg->m_addr = *addr;
+}
+
+int
+nni_msg_get_priority(const nni_msg *m)
+{
+	return (m->m_priority);
+}
+
+void
+nni_msg_set_priority(nni_msg *m, int prio)
+{
+	m->m_priority = prio;
 }

@@ -8,6 +8,7 @@
  */
 
 #include "aux_channel.h"
+#include "message.h" // nni_msg_set_priority
 
 #include <string.h>
 
@@ -144,8 +145,9 @@ aux_channel_recv_async(aux_channel ch, aux_future *fut)
  * ================================================================ */
 
 aux_err
-aux_channel_send_envelope(aux_channel ch, aux_envelope *env, int flags)
+aux_channel_send_envelope(aux_channel ch, aux_envelope *env, int flags, aux_priority priority)
 {
+    nni_msg_set_priority(env->inner, (int) priority);
     return (aux_err)nng_sendmsg(ch.inner, env->inner, flags);
 }
 

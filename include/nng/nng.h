@@ -962,7 +962,7 @@ NNG_DECL nng_listener nng_pipe_listener(nng_pipe);
 // for this is socket activation.  Not all transports support this.
 #define NNG_OPT_LISTEN_FD "listen-fd"
 
-// XXX: TBD: priorities, ipv4only
+// XXX: TBD: ipv4only
 
 // Statistics. These are for informational purposes only, and subject
 // to change without notice. The API for accessing these is stable,
